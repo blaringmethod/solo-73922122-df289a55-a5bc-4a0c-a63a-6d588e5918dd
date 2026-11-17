@@ -15,6 +15,15 @@ Fault injection (to exercise the harvester's edge cases):
   (``token_failures``), which also invalidates all outstanding tokens;
 * configurable page size and token TTL.
 
+Every ``ListRecords`` response carries an opaque ``sourceState`` attribute (on
+``ListRecords`` and on its ``resumptionToken``) computed from the *current*
+members and content of the requested window.  A token is only honoured while
+the window still has exactly the state it had when the token was issued; a
+record corrected out of the window and a late record moved into it change the
+marker even when the total size stays the same.  Such a token is rejected with
+``badResumptionToken`` so the harvester discards the whole pagination and
+restarts from page 1 of the original closed window.
+
 The demo repository persists to its own SQLite database so a restart does not
 lose demonstrations.
 """
@@ -23,6 +32,8 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
+import json
 import re
 import secrets
 import sqlite3
@@ -98,11 +109,19 @@ class DemoRepo:
                 window_until TEXT,
                 cursor INTEGER NOT NULL,
                 page_size INTEGER NOT NULL,
+                snapshot TEXT,
                 failed INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL
             )
             """
         )
+        # Databases created by an earlier build have no snapshot column.
+        columns = {
+            row["name"]
+            for row in self._conn.execute("PRAGMA table_info(tokens)").fetchall()
+        }
+        if "snapshot" not in columns:
+            self._conn.execute("ALTER TABLE tokens ADD COLUMN snapshot TEXT")
         self._conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES('page_size', ?)", (str(page_size),))
         self._conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES('slow_seconds', '0')")
         self._conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES('token_failures', '0')")
@@ -178,6 +197,9 @@ class DemoRepo:
                 "repository_name": meta.get("repository_name", "Library Demo Repository"),
                 "record_total": int(counts["total"] or 0),
                 "deleted_total": int(counts["deleted"] or 0),
+                "pagination_mutation_pending": bool(meta.get("pagination_mutation"))
+                and meta.get("pagination_mutation_done", "1") == "0",
+                "pagination_mutation": meta.get("pagination_mutation") or "",
                 "now": _fmt(datetime.now(timezone.utc)),
             }
 
@@ -222,9 +244,18 @@ class DemoRepo:
                 ).fetchone()
             )
 
-    def touch_record(self, identifier: str, *, title: str | None = None) -> dict[str, Any]:
+    def touch_record(
+        self,
+        identifier: str,
+        *,
+        title: str | None = None,
+        datestamp: datetime | None = None,
+    ) -> dict[str, Any]:
         """Correct a record (newer datestamp), so the next harvest updates it."""
-        now = _fmt(datetime.now(timezone.utc).replace(microsecond=0))
+        now = _fmt(
+            datestamp
+            or datetime.now(timezone.utc).replace(microsecond=0)
+        )
         with self._lock:
             existing = self._conn.execute(
                 "SELECT * FROM records WHERE identifier = ?", (identifier,)
@@ -328,6 +359,34 @@ class DemoRepo:
             selected.append(row)
         return selected
 
+    def _window_snapshot(
+        self, window_from: str | None, window_until: str, rows: list[sqlite3.Row]
+    ) -> str:
+        """Opaque digest of the window's members *and* their content.
+
+        It changes on any addition, removal, correction (new datestamp/title)
+        or withdrawal inside the window.  A pure size check cannot detect a
+        removal plus an insertion that keeps ``completeListSize`` constant.
+        """
+        digest = hashlib.sha256()
+        digest.update((window_from or "").encode("utf-8"))
+        digest.update(b"\x00")
+        digest.update(window_until.encode("utf-8"))
+        for row in rows:
+            digest.update(b"\x00")
+            digest.update(
+                "\x1f".join(
+                    [
+                        row["identifier"] or "",
+                        row["datestamp"] or "",
+                        "1" if row["deleted"] else "0",
+                        row["title"] or "",
+                        row["creator"] or "",
+                    ]
+                ).encode("utf-8")
+            )
+        return digest.hexdigest()[:24]
+
     def _issue_token(
         self,
         *,
@@ -335,14 +394,15 @@ class DemoRepo:
         window_until: str,
         cursor: int,
         page_size: int,
+        snapshot: str,
     ) -> str:
         token = base64.urlsafe_b64encode(secrets.token_bytes(18)).decode().rstrip("=")
         with self._lock:
             self._conn.execute(
                 """
                 INSERT INTO tokens(token, window_from, window_until, cursor,
-                                   page_size, failed, created_at)
-                VALUES(?, ?, ?, ?, ?, 0, ?)
+                                   page_size, snapshot, failed, created_at)
+                VALUES(?, ?, ?, ?, ?, ?, 0, ?)
                 """,
                 (
                     token,
@@ -350,6 +410,7 @@ class DemoRepo:
                     window_until,
                     cursor,
                     page_size,
+                    snapshot,
                     _fmt(datetime.now(timezone.utc)),
                 ),
             )
@@ -377,6 +438,157 @@ class DemoRepo:
                 self._conn.execute("DELETE FROM tokens WHERE token = ?", (token,))
                 return None
             return row
+
+    def _invalidate_window_tokens(
+        self, window_from: str | None, window_until: str
+    ) -> None:
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM tokens WHERE window_from IS ? AND window_until = ?",
+                (window_from, window_until),
+            )
+
+    # -------------------------------------------------- demo fault: mid-page
+    def arm_pagination_mutation(self, spec: dict[str, Any]) -> None:
+        """Arrange one (or several) mutation(s) between two page requests.
+
+        The demo applies the spec once, immediately before validating the next
+        ``resumptionToken``.  The window then has different members/content, so
+        the token is rejected and the harvester must restart from page 1.
+        ``repeat`` > 1 arms the same kind of change for the following retries:
+        each application moves one more record out of the window and adds one
+        late record inside it, so the total stays constant every time.
+        """
+        with self._lock:
+            spec = dict(spec)
+            spec.setdefault("repeat", 1)
+            spec.setdefault("applied", [])
+            self.set_meta("pagination_mutation", json.dumps(spec, ensure_ascii=False))
+            self.set_meta("pagination_mutation_done", "0")
+
+    def _apply_armed_mutation(self) -> None:
+        raw = self.get_meta("pagination_mutation", "")
+        if not raw or self.get_meta("pagination_mutation_done", "1") == "1":
+            return
+        with self._lock:
+            try:
+                spec = json.loads(raw)
+            except ValueError:
+                self.set_meta("pagination_mutation_done", "1")
+                return
+            if spec.get("auto"):
+                # Bind the mutation to the window of the page that was just
+                # served, so the "move out + late in" pair really changes this
+                # window (not some other range).
+                remembered_from, remembered_until = self.last_list_window()
+                if not spec.get("window_until") and remembered_until:
+                    spec["window_from"] = remembered_from or None
+                    spec["window_until"] = remembered_until
+                self._apply_auto_mutation(spec)
+            else:
+                self._apply_explicit_mutation(spec)
+            spec["repeat"] = int(spec.get("repeat", 1)) - 1
+            if spec["repeat"] <= 0:
+                self.set_meta("pagination_mutation_done", "1")
+            else:
+                self.set_meta(
+                    "pagination_mutation", json.dumps(spec, ensure_ascii=False)
+                )
+                self.set_meta("pagination_mutation_done", "0")
+
+    def _apply_explicit_mutation(self, spec: dict[str, Any]) -> None:
+        correct = spec.get("correct") or []
+        if len(correct) >= 2 and correct[0]:
+            target = self._conn.execute(
+                "SELECT 1 FROM records WHERE identifier = ?", (correct[0],)
+            ).fetchone()
+            if target is not None:
+                self.touch_record(
+                    correct[0],
+                    title=spec.get("correct_title"),
+                    datestamp=_identified(correct[1], "datestamp"),
+                )
+        added = spec.get("add") or []
+        if len(added) >= 2 and added[0]:
+            self.add_record(
+                identifier=added[0],
+                title=added[1] or "翻页期间补入的迟到记录",
+                creator=spec.get("add_creator"),
+                datestamp=(
+                    _identified(added[2], "datestamp")
+                    if len(added) >= 3 and added[2]
+                    else None
+                ),
+            )
+
+    def _apply_auto_mutation(self, spec: dict[str, Any]) -> None:
+        """Move one window member out and add one late member in (size stable)."""
+        window_from = spec.get("window_from")
+        window_until = spec.get("window_until")
+        if not window_until:
+            window_until = _fmt(datetime.now(timezone.utc))
+        until_dt = _identified(window_until, "until")
+        applied = set(spec.get("applied") or [])
+        rows = self._select_window(window_from, window_until)
+        candidates = [
+            row
+            for row in rows
+            if not row["deleted"] and row["identifier"] not in applied
+        ]
+        if not candidates:
+            return  # nothing left to move; leave the window unchanged
+        # The first member is the one page 1 starts with.  Correcting it out
+        # of the window shifts every later record forward, which is exactly
+        # what makes the old continuation cursor skip a record.
+        target = candidates[0]
+        # Move it outside the window (a "correction" to a future datestamp).
+        self.touch_record(
+            target["identifier"],
+            title=spec.get("correct_title") or "翻页期间更正移出时间窗",
+            datestamp=until_dt + timedelta(seconds=60 + len(applied)),
+        )
+        applied.add(target["identifier"])
+        spec["applied"] = sorted(applied)
+        spec["last_corrected"] = target["identifier"]
+        # Add one late record that *is* inside the same window, keeping the
+        # total constant so a size check alone cannot detect the change.
+        late_index = int(spec.get("auto_count", 0)) + 1
+        while self._conn.execute(
+            "SELECT 1 FROM records WHERE identifier = ?",
+            (f"oai:demo:late{late_index:02d}",),
+        ).fetchone():
+            late_index += 1
+        late_identifier = f"oai:demo:late{late_index:02d}"
+        # Place it on the upper bound (inclusive), which is inside every
+        # window the demo is asked about, including a zero-width retry window.
+        inside_dt = until_dt
+        self.add_record(
+            identifier=late_identifier,
+            title=spec.get("late_title") or "翻页期间补入的迟到记录",
+            creator=spec.get("late_creator"),
+            datestamp=inside_dt,
+        )
+        spec["auto_count"] = late_index
+
+    def last_list_window(self) -> tuple[str | None, str | None]:
+        with self._lock:
+            return (
+                self._meta_value("last_list_from"),
+                self._meta_value("last_list_until"),
+            )
+
+    def _meta_value(self, key: str) -> str | None:
+        row = self._conn.execute(
+            "SELECT value FROM meta WHERE key = ?", (key,)
+        ).fetchone()
+        return row["value"] if row else None
+
+    def _remember_list_window(
+        self, window_from: str | None, window_until: str
+    ) -> None:
+        with self._lock:
+            self.set_meta("last_list_from", window_from or "")
+            self.set_meta("last_list_until", window_until)
 
     # ------------------------------------------------------------- XML render
     def _render_record(self, row: sqlite3.Row) -> str:
@@ -458,6 +670,9 @@ class DemoRepo:
                     "badArgument",
                     "resumptionToken 不能与 metadataPrefix/from/until 同时使用",
                 )
+            # Fault injection for the "content changed between pages" demo:
+            # the source changes before it validates the cursor token.
+            self._apply_armed_mutation()
             token_row = self._consume_token(token)
             if token_row == "failed":
                 return self._error("badResumptionToken", "resumptionToken 已失效（演示故障注入）")
@@ -467,6 +682,7 @@ class DemoRepo:
             window_until = token_row["window_until"]
             cursor = int(token_row["cursor"])
             page_size = int(token_row["page_size"])
+            token_snapshot = token_row["snapshot"]
         else:
             metadata_prefix = params.get("metadataPrefix")
             if metadata_prefix != "oai_dc":
@@ -495,8 +711,21 @@ class DemoRepo:
                     return self._error("badArgument", "from 晚于 until")
             page_size = int(self.get_meta("page_size", "3") or 3)
             cursor = 0
+            token_snapshot = None
+            self._remember_list_window(window_from, window_until)
 
         selected = self._select_window(window_from, window_until)
+        snapshot = self._window_snapshot(window_from, window_until, selected)
+        if token and snapshot != token_snapshot:            # Members *or* their content changed while paging.  Even when the
+            # total stayed the same (one record moved out of the window and a
+            # late one moved in), the cursor would now skip a record, so the
+            # token cannot be honoured.  A legacy token without a stored
+            # snapshot is also rejected: its cursor cannot be trusted.
+            self._invalidate_window_tokens(window_from, window_until)
+            return self._error(
+                "badResumptionToken",
+                "分页期间时间窗内的书目成员或内容发生变化，令牌已作废",
+            )
         if not selected:
             return self._error("noRecordsMatch", "时间窗内没有记录")
         page = selected[cursor : cursor + page_size]
@@ -509,10 +738,12 @@ class DemoRepo:
                 window_until=window_until,
                 cursor=next_cursor,
                 page_size=page_size,
+                snapshot=snapshot,
             )
             token_xml = (
-                f"<resumptionToken completeListSize=\"{len(selected)}\" "
-                f"cursor=\"{cursor}\">{escape(new_token)}</resumptionToken>"
+                f'<resumptionToken completeListSize="{len(selected)}" '
+                f'cursor="{cursor}" sourceState="{snapshot}">'
+                f"{escape(new_token)}</resumptionToken>"
             )
         req = self._request(
             "ListRecords",
@@ -523,7 +754,8 @@ class DemoRepo:
             ],
         )
         return self._envelope(
-            f"{req}<ListRecords>{records_xml}{token_xml}</ListRecords>"
+            f'{req}<ListRecords sourceState="{snapshot}">'
+            f"{records_xml}{token_xml}</ListRecords>"
         )
 
     def dispatch(self, verb: str, params: dict[str, str]) -> str:

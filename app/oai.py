@@ -9,6 +9,14 @@ Only the pieces the harvester needs are implemented:
 The client never follows a token into a different window.  A stale token is
 surfaced as :class:`BadResumptionToken` so the caller can discard the whole
 staged attempt and request the original ``[from, until]`` window again.
+
+Besides the standard OAI-PMH attributes, a source may label each response with
+an opaque *source state* marker (``sourceState``/``state`` on ``ListRecords``
+and on ``resumptionToken``).  The harvester uses it to prove that every page
+and the next-page token describe the same snapshot of the window, which the
+standard ``completeListSize`` alone cannot do (a removal plus an insertion
+keeps the size constant while shifting the cursor).  The marker is optional
+for generic sources, but the demo source always provides it.
 """
 
 from __future__ import annotations
@@ -57,6 +65,20 @@ class OaiPage:
     complete_list_size: int | None = None
     cursor: int | None = None
     response_date: str | None = None
+    #: Opaque snapshot marker for the whole response (see module docstring).
+    source_state: str | None = None
+    #: Snapshot marker bound to the continuation token, when the source
+    #: exposes one.  It must equal :attr:`source_state` for the page content
+    #: and its token to describe the same source state.
+    token_state: str | None = None
+
+
+def _state_attr(element: ET.Element) -> str | None:
+    for name in ("sourceState", "state"):
+        raw = element.get(name)
+        if raw and raw.strip():
+            return raw.strip()
+    return None
 
 
 def normalize_datestamp(value: str | None, what: str = "datestamp") -> str:
@@ -190,6 +212,7 @@ def parse_list_records(content: bytes) -> OaiPage:
     token = _text(token_el)
     complete_list_size = None
     cursor = None
+    token_state = None
     if token_el is not None:
         raw_size = token_el.get("completeListSize")
         if raw_size and raw_size.strip().isdigit():
@@ -197,12 +220,15 @@ def parse_list_records(content: bytes) -> OaiPage:
         raw_cursor = token_el.get("cursor")
         if raw_cursor and raw_cursor.strip().isdigit():
             cursor = int(raw_cursor.strip())
+        token_state = _state_attr(token_el)
     return OaiPage(
         records=records,
         token=token,
         complete_list_size=complete_list_size,
         cursor=cursor,
         response_date=response_date,
+        source_state=_state_attr(list_records),
+        token_state=token_state,
     )
 
 

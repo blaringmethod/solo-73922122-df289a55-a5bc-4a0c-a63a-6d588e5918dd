@@ -526,7 +526,10 @@ class Store:
                            finished_at = ?,
                            phase = 'published',
                            watermark_after = ?,
-                           last_error = NULL
+                           last_error = CASE
+                               WHEN last_error IS NULL THEN NULL
+                               ELSE last_error || '（重取后已成功发布）'
+                           END
                      WHERE id = ?
                     """,
                     (now, watermark, run_id),

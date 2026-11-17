@@ -8,12 +8,23 @@ Contract implemented here:
   UTC time read from ``Identify``.  Re-reading the boundary second is harmless
   because staging keeps one row per identifier and the commit is idempotent.
 * Every round starts at page 1 of that window and continues until
-  ``ListRecords`` stops returning a resumption token.  If the source rejects a
-  token (expired), the whole staged attempt is discarded and the *original*
-  window is requested again from the beginning, up to ``max_attempts`` times.
-  Pages from the discarded attempt are never mixed into the published result.
-* Publication and watermark advance happen in a single SQLite transaction (see
-  :meth:`Store.commit_run`).  Any failure leaves published data untouched.
+  ``ListRecords`` stops returning a resumption token.  The whole attempt is
+  discarded and the *original* window is requested again from the beginning,
+  up to ``max_attempts`` times, whenever the source's window is not provably
+  stable during pagination:
+    - a page and its own continuation token carry different source-state
+      markers (the page content and the next-page cursor do not belong to the
+      same snapshot);
+    - a later page's marker differs from the marker of page 1;
+    - ``completeListSize`` changed.
+  A content change that keeps the total constant (a record corrected out of
+  the window while a late record enters it) changes the marker and is
+  therefore caught; the cursor alone would silently skip a record.  Pages from
+  a discarded attempt are never mixed into the published result.
+* Publication, watermark advance and the "run finished" flag happen in a
+  single SQLite transaction (see :meth:`Store.commit_run`).  Only a fully
+  re-fetched, consistent window is published; any failure leaves published
+  data untouched.
 * Cancellation is enforced between pages, while parsing, and again inside the
   commit transaction.  The API cancels the asyncio task so a slow page is not
   waited for; the task's late response can neither publish nor touch another
@@ -48,7 +59,7 @@ class HarvestFailed(Exception):
 
 
 class PaginationChanged(Exception):
-    """The source's result set changed size while a window was being paged."""
+    """The source's window members or content changed while being paged."""
 
 
 @dataclass
@@ -379,6 +390,7 @@ class Harvester:
         token: str | None = None
         seen_tokens: set[str] = set()
         seq = 0
+        page_marker: str | None = None
         lower_dt = parse_datestamp(window_from) if window_from else None
         upper_dt = parse_datestamp(window_until)
 
@@ -413,6 +425,45 @@ class Harvester:
             self._check_cancelled(control)
 
             stats.pages += 1
+            # --- source-state consistency ---------------------------------
+            # A page's content and the next-page cursor must belong to the
+            # same snapshot of the window.  When the source exposes a marker,
+            # require the token to carry the same marker as the page and all
+            # pages of this attempt to agree.  This catches a record moving
+            # out of the window plus a late record moving in, which leaves
+            # completeListSize unchanged but makes the cursor skip a record.
+            marker = page.source_state
+            if page.token:
+                # A continuation token must be bound to the same snapshot as
+                # the page it was returned with.  A source that labels pages
+                # (sourceState) must label its tokens too; otherwise the next
+                # cursor cannot be proven to belong to this page's content.
+                if marker is not None and page.token_state is None:
+                    raise PaginationChanged(
+                        "续页令牌缺少源状态标记，无法证明页内容与令牌"
+                        "属于同一源状态，作废本次分页"
+                    )
+                if page.token_state is not None and page.token_state != marker:
+                    raise PaginationChanged(
+                        "页内容与其续页令牌不属于同一源状态"
+                        f"（页 {marker or '无标记'} / "
+                        f"令牌 {page.token_state}），作废本次分页"
+                    )
+            if marker is not None:
+                if page_marker is not None and marker != page_marker:
+                    raise PaginationChanged(
+                        "分页期间源端时间窗内的书目成员或内容发生变化"
+                        f"（{page_marker} → {marker}），作废本次分页"
+                    )
+                page_marker = marker
+            elif page_marker is not None:
+                # The attempt was labelled from page 1; a later page without a
+                # marker cannot be proven to belong to the same snapshot.
+                raise PaginationChanged(
+                    "后续页缺少源状态标记，无法证明与首页属于同一源状态，"
+                    "作废本次分页"
+                )
+
             if page.complete_list_size is not None:
                 if (
                     stats.complete_list_size is not None

@@ -141,6 +141,63 @@ async def withdraw_all() -> RedirectResponse:
     return _back(f"已撤回 {count} 条记录")
 
 
+@app.post("/demo/pagination-mutation")
+async def pagination_mutation(
+    mode: str = Form("auto"),
+    identifier: str = Form(""),
+    new_datestamp: str = Form(""),
+    late_identifier: str = Form(""),
+    late_title: str = Form("翻页期间补入的迟到记录"),
+    late_datestamp: str = Form(""),
+    correct_title: str = Form(""),
+    repeat: int = Form(1),
+) -> RedirectResponse:
+    """Arm one "members/content changed between two pages" event.
+
+    On the next resumptionToken request the source changes the window (keeping
+    the record count constant) and only then validates the now-stale token.
+
+    * ``auto`` - the source picks a current window member, corrects its
+      datestamp to just outside the harvest window and inserts one late record
+      just inside it;
+    * ``explicit`` - the identifiers/datestamps below are used verbatim.
+
+    ``repeat`` > 1 re-arms the same event for subsequent retries, so a round
+    that keeps retrying eventually exhausts ``HARVEST_MAX_ATTEMPTS``.
+    """
+    repeat = max(1, min(repeat, 20))
+    if mode == "explicit":
+        if not (identifier.strip() and late_identifier.strip()):
+            return _back("显式模式：更正标识与迟到标识都不能为空")
+        try:
+            from .repository import _identified
+
+            _identified(new_datestamp, "new_datestamp")
+            _identified(late_datestamp, "late_datestamp")
+        except ValueError as exc:
+            return _back(f"时间戳不合法：{exc}")
+        spec = {
+            "correct": [identifier.strip(), new_datestamp.strip()],
+            "correct_title": correct_title.strip() or None,
+            "add": [
+                late_identifier.strip(),
+                late_title.strip() or "翻页期间补入的迟到记录",
+                late_datestamp.strip(),
+            ],
+            "repeat": repeat,
+        }
+    else:
+        spec = {
+            "auto": True,
+            "late_title": late_title.strip() or "翻页期间补入的迟到记录",
+            "correct_title": correct_title.strip() or None,
+            "repeat": repeat,
+        }
+    repo.arm_pagination_mutation(spec)
+    suffix = f"，并连续安排 {repeat} 次" if repeat > 1 else ""
+    return _back(f"已安排：下一次翻页时先更正移出并补入记录，再作废旧令牌{suffix}")
+
+
 @app.get("/demo/state.json")
 async def state_json() -> JSONResponse:
     return JSONResponse(
